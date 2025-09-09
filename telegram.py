@@ -5,664 +5,536 @@ import os
 import sys
 import time
 import json
-import shutil
+import math
+import shlex
 import signal
 import logging
-import contextlib
+import mimetypes
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-# =========================
-# Helpers básicos
-# =========================
+from datetime import datetime
+from dotenv import load_dotenv
+import requests
 
-def getenv_bool(name: str, default: str = "0") -> bool:
-    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
+# ---------- Carrega .env ----------
+load_dotenv(override=True)
 
-def human_size(n: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    f = float(n)
-    for u in units:
-        if f < 1024 or u == units[-1]:
-            return f"{f:.2f}{u}"
-        f /= 1024
-
-def which_ffmpeg() -> Optional[str]:
-    return shutil.which("ffmpeg")
-
-def which_ffprobe() -> Optional[str]:
-    return shutil.which("ffprobe")
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-# =========================
-# Carrega .env local (se existir)
-# =========================
-# Isso garante que as variáveis do .env sejam lidas mesmo quando o PM2 não injeta env.
-try:
-    from dotenv import load_dotenv
-    _dot = SCRIPT_DIR / ".env"
-    if _dot.exists():
-        load_dotenv(dotenv_path=_dot, override=True)
-except Exception:
-    pass
-
-# =========================
-# Descoberta de diretórios (dinâmica)
-# =========================
-
-def detect_download_dir() -> Path:
-    """
-    1) DOWNLOAD_DIR do env (se existir)
-    2) /root/charbot/download
-    3) SCRIPT_DIR/download
-    4) CWD/download
-    Cria a pasta escolhida, se não existir.
-    """
-    cands: List[Path] = []
-
-    env_dir = os.getenv("DOWNLOAD_DIR", "").strip()
-    if env_dir:
-        cands.append(Path(env_dir).expanduser())
-
-    cands.append(Path("/root/charbot/download"))
-    cands.append(SCRIPT_DIR / "download")
-    cands.append(Path.cwd() / "download")
-
-    for c in cands:
-        try:
-            c.mkdir(parents=True, exist_ok=True)
-            return c.resolve()
-        except Exception:
-            continue
-
-    # fallback duro
-    fallback = SCRIPT_DIR / "download"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback.resolve()
-
-def detect_quarantine_dir(download_dir: Path) -> Path:
-    env_q = os.getenv("QUARANTINE_DIR", "").strip()
-    q = Path(env_q) if env_q else (download_dir / "_bad")
-    q.mkdir(parents=True, exist_ok=True)
-    return q.resolve()
-
-# =========================
-# Variáveis (após descobrir pastas)
-# =========================
-
-DOWNLOAD_DIR = detect_download_dir()
-QUARANTINE_DIR = detect_quarantine_dir(DOWNLOAD_DIR)
-
-# Bot
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# Envio
-DELETE_AFTER_SEND = getenv_bool("DELETE_AFTER_SEND", "1")   # apaga o arquivo original após enviar
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-)
-
-# Watch / Loop
-WATCH = getenv_bool("WATCH", "1")
-WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL", "10"))
-
-# Extensões finais aceitas (sem .part)
-EXTENSIONS = [e if e.startswith(".") else "." + e for e in os.getenv("EXTENSIONS", ".mp4,.mkv,.mov,.m4v").split(",")]
-EXTENSIONS = [e.strip().lower() for e in EXTENSIONS if e.strip()]
-
-# Tamanhos e estabilidade
-MIN_FILE_MB = int(os.getenv("MIN_FILE_MB", "5"))           # ignora arquivos finais < 5MB
-MAX_FILE_GB = float(os.getenv("MAX_FILE_GB", "0"))         # 0 = sem limite
-FILE_STABLE_AGE = int(os.getenv("FILE_STABLE_AGE", os.getenv("STABLE_AGE", "30")))  # compat
-
-# Recuperação de .part
-RECOVER_PARTS = getenv_bool("RECOVER_PARTS", "1")
-PART_STABLE_AGE = int(os.getenv("PART_STABLE_AGE", "180")) # .part precisa "parar de crescer" por N seg
-PART_MIN_MB = int(os.getenv("PART_MIN_MB", "5"))           # ignora .part < 5MB
-MOVE_BAD_PARTS = getenv_bool("MOVE_BAD_PARTS", "1")
-
-# Log
+# ---------- Logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-# =========================
-# Logging
-# =========================
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# =========================
-# ffprobe / ffmpeg helpers
-# =========================
+# ---------- Utilidades ----------
+def human_size(b: int) -> str:
+    if b is None:
+        return "0B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    f = float(b)
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024.0
+        i += 1
+    return f"{f:.2f}{units[i]}"
 
-def ffprobe_json(path: Path) -> dict:
-    ffprobe = which_ffprobe()
-    if not ffprobe:
-        return {}
-    try:
-        out = subprocess.check_output([
-            ffprobe, "-v", "error",
-            "-print_format", "json",
-            "-show_streams", "-show_format",
-            str(path)
-        ], stderr=subprocess.STDOUT)
-        return json.loads(out.decode("utf-8", "ignore"))
-    except Exception:
-        return {}
+def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
+    """Executa comando e retorna (returncode, stdout, stderr)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out, err = proc.communicate()
+    return proc.returncode, out, err
 
-def probe_video_params(path: Path) -> Tuple[int, int, int]:
-    """
-    Retorna (width, height, duration_seg) se conseguir; senão (0,0,0).
-    """
-    info = ffprobe_json(path)
-    width = height = dur = 0
-    for s in info.get("streams", []):
-        if s.get("codec_type") == "video":
-            try:
-                width = int(float(s.get("width", 0) or 0))
-                height = int(float(s.get("height", 0) or 0))
-            except Exception:
-                width = height = 0
-            ds = s.get("duration")
-            if ds:
-                try:
-                    dur = int(float(ds))
-                except Exception:
-                    pass
-            break
-    if dur == 0:
-        df = info.get("format", {}).get("duration")
-        if df:
-            try:
-                dur = int(float(df))
-            except Exception:
-                pass
-    return width, height, dur
-
-def is_mp4_h264_aac(path: Path) -> bool:
-    if path.suffix.lower() != ".mp4":
-        return False
-    info = ffprobe_json(path)
-    v_ok = a_ok = False
-    for s in info.get("streams", []):
-        if s.get("codec_type") == "video" and s.get("codec_name") in ("h264", "avc1"):
-            v_ok = True
-        if s.get("codec_type") == "audio" and s.get("codec_name") in ("aac",):
-            a_ok = True
-    return v_ok and a_ok
-
-def remux_copy(src: Path, dst: Path, container: str = "mp4") -> bool:
-    """
-    Remux cópia (sem reencode) para MP4 ou MKV com flags tolerantes.
-    """
-    ffmpeg = which_ffmpeg()
-    if not ffmpeg:
-        return False
-    out = dst.with_suffix(f".{container}")
-    args = [
-        ffmpeg, "-y",
-        "-fflags", "+genpts", "-err_detect", "ignore_err",
-        "-i", str(src),
-        "-c", "copy",
+def ffprobe_probe(path: Path) -> dict:
+    """Obtém metadados via ffprobe (duração, largura, altura)."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "format=duration:stream=width,height",
+        "-of", "json", str(path)
     ]
-    if container == "mp4":
-        args += ["-movflags", "+faststart"]
-    args += [str(out)]
+    rc, out, err = run_cmd(cmd)
+    if rc != 0:
+        return {}
     try:
-        subprocess.check_call(args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        return out.exists()
-    except Exception:
-        with contextlib.suppress(Exception):
-            if out.exists(): out.unlink()
-        return False
-
-def transcode_preserve_ar(src: Path, dst: Path, container: str = "mp4") -> bool:
-    """
-    Transcode preservando AR (nada de quadrado), 1280x720 bounding box e setsar=1.
-    """
-    ffmpeg = which_ffmpeg()
-    if not ffmpeg:
-        return False
-    out = dst.with_suffix(f".{container}")
-    scale_expr = "scale='if(gt(a,16/9),1280,-2)':'if(gt(a,16/9),-2,720)',setsar=1"
-    try:
-        subprocess.check_call([
-            ffmpeg, "-y",
-            "-fflags", "+genpts", "-err_detect", "ignore_err",
-            "-analyzeduration", "100M", "-probesize", "100M",
-            "-i", str(src),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-vf", scale_expr,
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart" if container == "mp4" else "frag_keyframe",
-            str(out)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        return out.exists()
-    except Exception:
-        with contextlib.suppress(Exception):
-            if out.exists(): out.unlink()
-        return False
-
-def remux_to_mp4_copy(src: Path, dst: Path) -> bool:
-    ffmpeg = which_ffmpeg()
-    if not ffmpeg:
-        return False
-    try:
-        subprocess.check_call([
-            ffmpeg, "-y",
-            "-fflags", "+genpts", "-err_detect", "ignore_err",
-            "-i", str(src),
-            "-c", "copy",
-            "-movflags", "+faststart",
-            str(dst)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        return dst.exists()
-    except Exception:
-        with contextlib.suppress(Exception):
-            if dst.exists(): dst.unlink()
-        return False
-
-def remux_to_mp4_copy_v_copy_aac(src: Path, dst: Path) -> bool:
-    """
-    Copia vídeo; força áudio AAC se necessário.
-    """
-    ffmpeg = which_ffmpeg()
-    if not ffmpeg:
-        return False
-    try:
-        subprocess.check_call([
-            ffmpeg, "-y",
-            "-fflags", "+genpts", "-err_detect", "ignore_err",
-            "-i", str(src),
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(dst)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        return dst.exists()
-    except Exception:
-        with contextlib.suppress(Exception):
-            if dst.exists(): dst.unlink()
-        return False
-
-def ensure_streamable_mp4(src: Path) -> Tuple[Path, List[Path]]:
-    """
-    Garante um .mp4 “streamável”:
-      1) se já for MP4 H.264/AAC → retorna src
-      2) remux copy → .mp4
-      3) copy de vídeo + AAC no áudio → .mp4
-      4) transcode completo (preserva AR) → .mp4
-    Retorna (mp4_path, temporarios_gerados_para_limpar)
-    """
-    temps: List[Path] = []
-    if is_mp4_h264_aac(src):
-        return src, temps
-
-    base = src.with_suffix("")  # remove .part se houver
-    target = base.with_suffix(".mp4")
-    if target.exists():
-        target = target.with_stem(target.stem + f"__tg_{int(time.time())}")
-
-    # 1) remux copy puro
-    if remux_to_mp4_copy(src, target):
-        temps.append(target)
-        return target, temps
-
-    # 2) copia vídeo + AAC
-    if remux_to_mp4_copy_v_copy_aac(src, target):
-        temps.append(target)
-        return target, temps
-
-    # 3) transcode completo
-    if transcode_preserve_ar(src, base, container="mp4"):
-        target = base.with_suffix(".mp4")
-        temps.append(target)
-        return target, temps
-
-    # se nada deu certo, volta original
-    return src, temps
-
-# =========================
-# Recuperação de .part
-# =========================
-
-def finalize_part_file(p: Path) -> Optional[Path]:
-    """
-    Estratégia em cascata para recuperar .part:
-      1) remux → MP4
-      2) remux → MKV
-      3) transcode → MP4 (AR preservada)
-      4) transcode → MKV
-    Retorna caminho final gerado, se houver.
-    """
-    base_no_part = p.with_suffix("")
-    out_base = base_no_part if base_no_part.suffix.lower() in (".mp4", ".mkv") else base_no_part.with_suffix(".mp4")
-
-    # 1) remux MP4
-    if remux_copy(p, out_base, container="mp4"):
-        return out_base.with_suffix(".mp4")
-
-    # 2) remux MKV (mais tolerante)
-    if remux_copy(p, out_base, container="mkv"):
-        return out_base.with_suffix(".mkv")
-
-    # 3) transcode MP4
-    if transcode_preserve_ar(p, out_base, container="mp4"):
-        return out_base.with_suffix(".mp4")
-
-    # 4) transcode MKV
-    if transcode_preserve_ar(p, out_base, container="mkv"):
-        return out_base.with_suffix(".mkv")
-
-    return None
-
-def recover_partials(root: Path) -> List[Path]:
-    """
-    Busca .part estáveis e tenta finalizar (AGORA RECURSIVO).
-    Move para quarentena se falhar (opcional).
-    """
-    recovered: List[Path] = []
-    now = time.time()
-    for pf in sorted(root.rglob("*.part")):  # <-- rglob para achar em subpastas
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+    info = {}
+    if "format" in data and "duration" in data["format"]:
         try:
-            age = now - pf.stat().st_mtime
-            size = pf.stat().st_size
-        except FileNotFoundError:
-            continue
+            info["duration"] = float(data["format"]["duration"])
+        except Exception:
+            pass
+    if "streams" in data and data["streams"]:
+        st = data["streams"][0]
+        if "width" in st and "height" in st:
+            info["width"] = int(st["width"])
+            info["height"] = int(st["height"])
+    return info
 
-        if age < PART_STABLE_AGE:
-            logging.debug("Parcial jovem (%.0fs < %ds): %s", age, PART_STABLE_AGE, pf)
-            continue
-        if size < PART_MIN_MB * 1024 * 1024:
-            logging.warning("Parcial muito pequeno, pulando: %s (%s)", pf.name, human_size(size))
-            continue
+# ---------- Config ----------
+def getenv_bool(name: str, default: int = 0) -> bool:
+    v = os.getenv(name, str(default)).strip()
+    return v in ("1", "true", "yes", "on", "True", "TRUE")
 
-        logging.info("Recuperando parcial: %s", pf)
-        out = finalize_part_file(pf)
-        if out and out.exists():
-            with contextlib.suppress(Exception):
-                pf.unlink()
-            logging.info("Parcial finalizado ➜ %s (%s)", out, human_size(out.stat().st_size))
-            recovered.append(out)
-        else:
-            logging.warning("Falha ao finalizar parcial: %s", pf)
-            if MOVE_BAD_PARTS:
-                try:
-                    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
-                    dest = QUARANTINE_DIR / pf.name
-                    pf.rename(dest)
-                    logging.info("Movido para quarentena: %s", dest)
-                except Exception as e:
-                    logging.error("Não foi possível mover para quarentena: %s -> %s (%s)", pf, QUARANTINE_DIR, e)
-    return recovered
+@dataclass
+class Cfg:
+    # Pastas
+    base_dir: Path
+    download_dir: Path
+    log_dir: Path
+    quarantine_dir: Optional[Path]
+    move_bad_parts: bool
 
+    # Watch / fluxo
+    watch: bool
+    watch_interval: int
+    file_stable_age: int
+    delete_after_send: bool
 
-# =========================
-# Seleção de arquivos prontos
-# =========================
+    # Seleção de arquivos
+    extensions: List[str]
+    min_file_mb: int
+    max_file_gb: float  # 0 = sem limite
 
-def is_stable(path: Path, min_age: int) -> bool:
+    # Telegram Bot API
+    bot_token: Optional[str]
+    chat_id: Optional[str]
+    bot_small_limit_mb: int  # limite para usar Bot API (evita 413)
+    use_bot_api: bool
+
+    # Telethon / MTProto
+    enable_mtproto: bool
+    tg_api_id: Optional[int]
+    tg_api_hash: Optional[str]
+    premium: bool  # 4 GB se True, caso contrário 2 GB
+    mt_part_kb: int
+
+    # Split
+    enable_split: bool
+    split_piece_gb: float  # tamanho alvo de cada parte
+    keep_original_after_split: bool
+
+    # Legenda
+    caption_template: str
+
+def load_cfg() -> Cfg:
+    base_dir = Path(os.getenv("BASE_DIR", str(Path.cwd()))).resolve()
+
+    download_dir = Path(os.getenv("DOWNLOAD_DIR", str(base_dir / "download"))).resolve()
+    log_dir = Path(os.getenv("LOG_DIR", str(base_dir / "logs"))).resolve()
+
+    quarantine_raw = os.getenv("QUARANTINE_DIR", "").strip()
+    quarantine_dir = Path(quarantine_raw).resolve() if quarantine_raw else None
+
+    extensions = [e.strip().lower() for e in os.getenv("EXTENSIONS", ".mp4,.mkv,.mov,.m4v").split(",") if e.strip()]
+    if not extensions:
+        extensions = [".mp4"]
+
+    cfg = Cfg(
+        base_dir=base_dir,
+        download_dir=download_dir,
+        log_dir=log_dir,
+        quarantine_dir=quarantine_dir,
+        move_bad_parts=getenv_bool("MOVE_BAD_PARTS", 1),
+
+        watch=getenv_bool("WATCH", 1),
+        watch_interval=int(os.getenv("WATCH_INTERVAL", "10")),
+        file_stable_age=int(os.getenv("STABLE_AGE", "20")),
+        delete_after_send=getenv_bool("DELETE_AFTER_SEND", 1),
+
+        extensions=extensions,
+        min_file_mb=int(os.getenv("MIN_FILE_MB", "1")),
+        max_file_gb=float(os.getenv("MAX_FILE_GB", "0")),
+
+        bot_token=os.getenv("TELEGRAM_TOKEN", "").strip() or None,
+        chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip() or None,
+        bot_small_limit_mb=int(os.getenv("BOT_SMALL_LIMIT_MB", "45")),  # margem < 50MB
+        use_bot_api=getenv_bool("USE_BOT_API", 1),
+
+        enable_mtproto=getenv_bool("ENABLE_MTPROTO", 0),
+        tg_api_id=int(os.getenv("TG_API_ID", "0")) or None,
+        tg_api_hash=os.getenv("TG_API_HASH", "").strip() or None,
+        premium=getenv_bool("TELEGRAM_PREMIUM", 0),
+        mt_part_kb=int(os.getenv("MT_PART_KB", "1024")),
+
+        enable_split=getenv_bool("ENABLE_SPLIT", 1),
+        split_piece_gb=float(os.getenv("SPLIT_PIECE_GB", "1.95")),  # “seguro” p/ 2GB
+        keep_original_after_split=getenv_bool("KEEP_ORIGINAL_AFTER_SPLIT", 0),
+
+        caption_template=os.getenv("CAPTION_TEMPLATE", "{folder_tag} {filename}").strip(),
+    )
+    return cfg
+
+# ---------- Estabilidade / seleção ----------
+def is_stable(p: Path, stable_age: int) -> bool:
     try:
-        age = time.time() - path.stat().st_mtime
-        return age >= min_age
+        mtime = p.stat().st_mtime
     except FileNotFoundError:
         return False
+    return (time.time() - mtime) >= stable_age
 
-def list_ready_files(root: Path) -> List[Path]:
-    """
-    Lista arquivos finalizados, recorrendo subpastas e explicando no log
-    por que cada um foi ignorado (tamanho, idade, extensão ou limite).
-    Também ignora temporários tipo '.__tmp__.mp4'.
-    Permite 'FORCE_SEND_ALL=1' para ignorar idade mínima.
-    """
-    force = str(os.getenv("FORCE_SEND_ALL", "0")).strip() in ("1", "true", "yes", "on")
-    candidates: List[Path] = []
-    exts = set(EXTENSIONS)  # p.ex.: {".mp4",".mkv",".mov",".m4v"}
-
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-
-        suf = p.suffix.lower()
-        if suf not in exts:
-            continue
-
-        name = p.name.lower()
-
-        # ignora parciais/temporários
-        if name.endswith(".part"):
-            logging.debug("Ignorando .part: %s", p)
-            continue
-        if "__tmp__" in name:
-            logging.debug("Ignorando temporário (__tmp__): %s", p)
-            continue
-
-        # tamanho
-        try:
-            size = p.stat().st_size
-        except FileNotFoundError:
-            continue
-
-        if size < MIN_FILE_MB * 1024 * 1024:
-            logging.debug("Ignorando (pequeno < %dMB): %s (%s)", MIN_FILE_MB, p, human_size(size))
-            continue
-
-        # limite de tamanho (se configurado)
-        if MAX_FILE_GB > 0 and size > MAX_FILE_GB * (1024 ** 3):
-            logging.warning("Ignorando (muito grande, > %.2fGB): %s (%s)", MAX_FILE_GB, p, human_size(size))
-            continue
-
-        # estabilidade (a não ser que FORCE_SEND_ALL)
-        if not force:
+def list_ready_files(root: Path, cfg: Cfg) -> List[Path]:
+    cand: List[Path] = []
+    for ext in cfg.extensions:
+        for p in root.rglob(f"*{ext}"):
+            if p.name.endswith(".part"):
+                continue
             try:
-                age = time.time() - p.stat().st_mtime
+                size = p.stat().st_size
             except FileNotFoundError:
                 continue
-            if age < FILE_STABLE_AGE:
-                logging.debug("Ignorando (ainda mexendo, %.0fs < %ds): %s", age, FILE_STABLE_AGE, p)
+            if size < cfg.min_file_mb * 1024 * 1024:
                 continue
+            if not is_stable(p, cfg.file_stable_age):
+                continue
+            # NÃO descarte os grandes aqui — deixe para o split/MTProto decidir.
+            cand.append(p)
+    cand.sort(key=lambda x: x.stat().st_mtime)  # mais antigos primeiro
+    return cand
 
-        candidates.append(p)
+# ---------- Recuperação de parciais ----------
+def try_finalize_part(p: Path) -> Optional[Path]:
+    """
+    Heurística leve para fechar .part: se o .mp4 "final" já existe com mesmo prefixo,
+    preferir o final; caso contrário, se for .part e estiver estável, renomeia removendo .part.
+    """
+    if not p.name.endswith(".part"):
+        return None
 
-    # mais antigos primeiro (quem está “parado” há mais tempo sai antes)
-    def mtime_safe(x: Path) -> float:
+    candidate = p.with_suffix("")  # remove .part
+    if candidate.exists():
+        # Já existe arquivo final com o mesmo nome-base: apague o .part “antigo”
         try:
-            return x.stat().st_mtime
-        except FileNotFoundError:
-            return time.time()
+            p.unlink(missing_ok=True)
+            logging.info("Descartando parcial redundante: %s", p.name)
+        except Exception:
+            pass
+        return candidate
 
-    candidates.sort(key=mtime_safe)
-    logging.info("Prontos para envio (%d): %s", len(candidates), ", ".join(str(c) for c in candidates[:10]) + ("..." if len(candidates) > 10 else ""))
-    return candidates
+    # Se estável, tentar “promover” o .part.
+    if is_stable(p, 60):
+        try:
+            p.rename(candidate)
+            logging.info("Promovido .part -> final: %s", candidate.name)
+            return candidate
+        except Exception as e:
+            logging.warning("Falha ao renomear .part: %s (%s)", p.name, e)
+    return None
 
-def build_caption(path: Path) -> str:
+def recover_partials(root: Path, cfg: Cfg):
+    parts = list(root.rglob("*.part"))
+    for pp in sorted(parts, key=lambda x: x.stat().st_mtime):
+        out = try_finalize_part(pp)
+        if out is None and cfg.move_bad_parts and cfg.quarantine_dir:
+            try:
+                cfg.quarantine_dir.mkdir(parents=True, exist_ok=True)
+                dest = cfg.quarantine_dir / pp.name
+                pp.rename(dest)
+                logging.info("Parcial movido para quarentena: %s", dest)
+            except Exception as e:
+                logging.warning("Falha ao mover para quarentena: %s (%s)", pp.name, e)
+
+# ---------- Envio Bot API (arquivos pequenos) ----------
+def upload_via_bot_api(chat_id: str, path: Path, caption: str) -> bool:
+    url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendVideo"
+    size = path.stat().st_size
+    logging.info("BOT-API enviando: %s (%s)", path.name, human_size(size))
+
+    def iter_file(fp, chunk=1024*512):
+        sent = 0
+        while True:
+            data = fp.read(chunk)
+            if not data:
+                break
+            sent += len(data)
+            pct = (sent / size) * 100.0
+            logging.info("BOT upload %s: %.1f%% (%s/%s)", path.name, pct, human_size(sent), human_size(size))
+            yield data
+
+    with path.open("rb") as f:
+        files = {"video": (path.name, iter_file(f), mimetypes.guess_type(path.name)[0] or "video/mp4")}
+        data = {
+            "chat_id": chat_id,
+            "caption": caption,
+            "supports_streaming": "true",
+            "disable_notification": "true",
+        }
+        try:
+            r = requests.post(url, data=data, files=files, timeout=60*60)
+            if r.status_code != 200:
+                logging.error("BOT falhou [%s]: %s", r.status_code, r.text)
+                return False
+            logging.info("BOT enviado: %s", path.name)
+            return True
+        except Exception as e:
+            logging.exception("BOT erro ao enviar: %s", e)
+            return False
+
+# ---------- Envio via Telethon (MTProto) ----------
+_telethon_client = None
+def get_telethon_client(cfg: Cfg):
+    global _telethon_client
+    if _telethon_client is not None:
+        return _telethon_client
+    from telethon import TelegramClient
+    session_name = os.getenv("TELETHON_SESSION_NAME", "bot")  # cria bot.session
+    client = TelegramClient(session_name, cfg.tg_api_id, cfg.tg_api_hash)
+    client.start(bot_token=cfg.bot_token)
+    _telethon_client = client
+    return client
+
+def upload_via_mtproto(chat_id: str, path: Path, caption: str) -> bool:
+    from telethon.tl.types import DocumentAttributeVideo
+    client = get_telethon_client(cfg)
+
+    meta = ffprobe_probe(path)
+    width = meta.get("width", 0) or None
+    height = meta.get("height", 0) or None
+    duration = meta.get("duration", 0.0) or None
+
+    # Progress callback
+    size = path.stat().st_size
+    last_log = {"t": 0}
+
+    def on_progress(sent, total):
+        now = time.time()
+        if now - last_log["t"] >= 0.25:
+            pct = (sent / total) * 100.0 if total else 0.0
+            logging.info("MTProto upload %s: %.1f%% (%s/%s)",
+                         path.name, pct, human_size(sent), human_size(total))
+            last_log["t"] = now
+
+    attrs = []
+    if duration or width or height:
+        try:
+            attrs.append(DocumentAttributeVideo(
+                duration=int(duration) if duration else 0,
+                w=int(width) if width else 0,
+                h=int(height) if height else 0,
+                supports_streaming=True
+            ))
+        except Exception:
+            pass
+
+    async def _send():
+        entity = chat_id
+        try:
+            await client.send_file(
+                entity,
+                file=str(path),
+                caption=caption,
+                attributes=attrs if attrs else None,
+                force_document=False,   # **garante como vídeo**
+                video=True,             # dica adicional
+                part_size_kb=cfg.mt_part_kb,
+                progress_callback=on_progress
+            )
+            return True
+        except Exception as e:
+            logging.exception("MTProto falhou: %s", e)
+            return False
+
+    # roda o async
     try:
-        size = human_size(path.stat().st_size)
-    except FileNotFoundError:
-        size = "?"
-    # Você pode personalizar com tags de pasta, etc:
-    return f"{path.name} | {size}"
-
-# =========================
-# Envio p/ Telegram (sempre VÍDEO)
-# =========================
-
-def upload_via_bot(chat_id: str, path: Path, caption: str) -> bool:
-    """
-    Envia sempre com sendVideo (vídeo, não documento),
-    garantindo MP4 streamável antes do envio.
-    """
-    try:
-        import requests
-    except Exception:
-        logging.error("Biblioteca 'requests' não instalada.")
+        ok = client.loop.run_until_complete(_send())
+        if ok:
+            logging.info("MTProto enviado: %s", path.name)
+        return ok
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        logging.exception("MTProto erro: %s", e)
         return False
 
-    # Encoder com barra de progresso (opcional)
+# ---------- Split por tamanho (sem reencode) ----------
+def compute_piece_duration_seconds(path: Path, target_bytes: int) -> Optional[int]:
+    meta = ffprobe_probe(path)
+    if not meta or "duration" not in meta:
+        return None
+    total_bytes = path.stat().st_size
+    total_sec = float(meta["duration"])
+    # proporção aproximada: duração * (target_bytes / total_bytes)
+    piece = max(60.0, total_sec * (target_bytes / max(1.0, float(total_bytes))))
+    return int(piece)
+
+def split_video_copy(path: Path, piece_bytes: int) -> List[Path]:
+    """
+    Particiona sem re-encode, por tempo aproximado, preservando streaming.
+    Gera arquivos: <basename>.p001.mp4, .p002.mp4, ...
+    """
+    piece_dur = compute_piece_duration_seconds(path, piece_bytes)
+    if not piece_dur:
+        # fallback: ~15 minutos
+        piece_dur = 15 * 60
+
+    base = path.with_suffix("")  # remove .mp4
+    out_pattern = f"{base.name}.p%03d.mp4"
+    out_dir = path.parent
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-c", "copy",
+        "-map", "0",
+        "-f", "segment",
+        "-segment_time", str(piece_dur),
+        "-reset_timestamps", "1",
+        str(out_dir / out_pattern)
+    ]
+    logging.info("Split ffmpeg: %s", " ".join(shlex.quote(c) for c in cmd))
+    rc, out, err = run_cmd(cmd)
+    if rc != 0:
+        logging.error("ffmpeg split falhou: %s", err.strip())
+        return []
+
+    parts = sorted(out_dir.glob(f"{base.name}.p*.mp4"))
+    # Filtra vazios/corrompidos
+    parts = [p for p in parts if p.stat().st_size > 1024 * 1024]
+    for p in parts:
+        logging.info("Criado segmento: %s (%s)", p.name, human_size(p.stat().st_size))
+    return parts
+
+# ---------- Envio orquestrado ----------
+def build_caption(cfg: Cfg, path: Path, part_idx: Optional[int] = None, part_total: Optional[int] = None) -> str:
+    # folder_tag = nome da subpasta (modelo)
     try:
-        from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+        folder_tag = path.parent.name
     except Exception:
-        MultipartEncoder = MultipartEncoderMonitor = None
+        folder_tag = ""
+    base_caption = cfg.caption_template.format(folder_tag=f"[{folder_tag}]" if folder_tag else "", filename=path.name)
+    if part_idx is not None and part_total is not None and part_total > 1:
+        return f"{base_caption} • Parte {part_idx}/{part_total}"
+    return base_caption
 
-    # 1) garante MP4 streamável
-    mp4_path, temps = ensure_streamable_mp4(path)
-    w, h, dur = probe_video_params(mp4_path)
+def send_one(cfg: Cfg, path: Path) -> bool:
+    size = path.stat().st_size
+    size_mb = size / (1024**2)
+    size_gb = size / (1024**3)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo"
-    size = mp4_path.stat().st_size
-    filename = mp4_path.name
-
-    fields = {
-        "chat_id": str(chat_id),
-        "caption": caption,
-        "supports_streaming": "true",
-    }
-    if w > 0: fields["width"] = str(w)
-    if h > 0: fields["height"] = str(h)
-    if dur > 0: fields["duration"] = str(dur)
-
-    headers = {"User-Agent": USER_AGENT}
-
-    if MultipartEncoder and MultipartEncoderMonitor:
-        fields["video"] = (filename, open(mp4_path, "rb"), "video/mp4")
-        enc = MultipartEncoder(fields=fields)
-        sent = {"n": 0}
-
-        def cb(m: MultipartEncoderMonitor):
-            sent["n"] = m.bytes_read
-            pct = (sent["n"]/size*100) if size else 0.0
-            logging.info("BOT upload %s: %.1f%% (%s/%s)", filename, pct, human_size(sent["n"]), human_size(size))
-
-        mon = MultipartEncoderMonitor(enc, cb)
-        headers.update({"Content-Type": mon.content_type})
-
-        try:
-            r = requests.post(url, data=mon, headers=headers, timeout=60*60)
-            if r.ok:
-                logging.info("BOT enviado: %s", filename)
-                # Limpa temporários gerados nesta função
-                for t in temps:
-                    if t != path and t.exists():
-                        with contextlib.suppress(Exception):
-                            t.unlink()
-                return True
-            else:
-                logging.error("BOT falhou [%s]: %s", r.status_code, r.text[:300])
-                return False
-        except Exception as e:
-            logging.exception("BOT exceção ao enviar %s: %s", filename, e)
-            return False
-    else:
-        # Fallback sem progresso
-        with open(mp4_path, "rb") as f:
-            files = {"video": (filename, f, "video/mp4")}
+    # 1) pequenos: Bot API (evita 413)
+    if cfg.use_bot_api and size_mb <= cfg.bot_small_limit_mb:
+        ok = upload_via_bot_api(cfg.chat_id, path, build_caption(cfg, path))
+        if ok and cfg.delete_after_send:
             try:
-                r = requests.post(url, data=fields, files=files, headers=headers, timeout=60*60)
-                if r.ok:
-                    logging.info("BOT enviado: %s", filename)
-                    for t in temps:
-                        if t != path and t.exists():
-                            with contextlib.suppress(Exception):
-                                t.unlink()
-                    return True
-                else:
-                    logging.error("BOT falhou [%s]: %s", r.status_code, r.text[:300])
-                    return False
-            except Exception as e:
-                logging.exception("BOT exceção ao enviar %s: %s", filename, e)
-                return False
-
-# =========================
-# Pipeline de envio
-# =========================
-
-def send_one(path: Path) -> bool:
-    """
-    Envia um arquivo (como vídeo) e apaga o original se configurado.
-    """
-    caption = build_caption(path)
-    ok = upload_via_bot(TELEGRAM_CHAT_ID, path, caption)
-    if ok and DELETE_AFTER_SEND:
-        with contextlib.suppress(Exception):
-            if path.exists():
                 path.unlink()
-        logging.info("Apagado: %s", path.name)
-    return ok
+                logging.info("Apagado: %s", path.name)
+            except Exception:
+                pass
+        return ok
 
-def run_once():
-    # 1) Recupera .part (opcional)
-    if RECOVER_PARTS:
-        recover_partials(DOWNLOAD_DIR)
+    # 2) MTProto direto (<= limite do cliente)
+    mt_limit_gb = 4.0 if cfg.premium else 2.0
+    if cfg.enable_mtproto and size_gb <= mt_limit_gb:
+        ok = upload_via_mtproto(cfg.chat_id, path, build_caption(cfg, path))
+        if ok and cfg.delete_after_send:
+            try:
+                path.unlink()
+                logging.info("Apagado: %s", path.name)
+            except Exception:
+                pass
+        return ok
 
-    # 2) Envia arquivos prontos (varre recursivamente subpastas)
-    files = list_ready_files(DOWNLOAD_DIR)
+    # 3) Maior que o limite -> split
+    if cfg.enable_split and cfg.enable_mtproto:
+        target_gb = min(cfg.split_piece_gb, mt_limit_gb - 0.05)  # margem de segurança
+        target_bytes = int(target_gb * (1024**3))
+        parts = split_video_copy(path, target_bytes)
+        if not parts:
+            logging.error("Sem partes geradas; abortando envio de %s", path.name)
+            return False
+
+        total = len(parts)
+        ok_all = True
+        for i, part in enumerate(parts, start=1):
+            cap = build_caption(cfg, part, i, total)
+            ok = upload_via_mtproto(cfg.chat_id, part, cap)
+            if ok:
+                try:
+                    part.unlink()
+                    logging.info("Apagado segmento: %s", part.name)
+                except Exception:
+                    pass
+            else:
+                ok_all = False
+                # opcional: parar nos erros
+                logging.error("Falha ao enviar segmento %s", part.name)
+                break
+
+        # remove original no fim (se configurado)
+        if ok_all and cfg.delete_after_send and not cfg.keep_original_after_split:
+            try:
+                path.unlink()
+                logging.info("Apagado original após split: %s", path.name)
+            except Exception:
+                pass
+        return ok_all
+
+    logging.error(
+        "Arquivo %s (%s) excede o limite (%s GB) e split/MTProto está desabilitado.",
+        path.name, human_size(size), mt_limit_gb
+    )
+    return False
+
+# ---------- Loop principal ----------
+_stop = False
+def _sig_handler(signum, frame):
+    global _stop
+    logging.warning("Sinal recebido (%s). Encerrando após o ciclo atual...", signum)
+    _stop = True
+
+signal.signal(signal.SIGINT, _sig_handler)
+signal.signal(signal.SIGTERM, _sig_handler)
+
+def run_once(cfg: Cfg):
+    # Recupera parciais primeiro
+    recover_partials(cfg.download_dir, cfg)
+    # Lista prontos
+    files = list_ready_files(cfg.download_dir, cfg)
     if not files:
-        logging.debug("Nenhum arquivo pronto para envio.")
         return
-
     for p in files:
-        logging.info("Preparando envio: %s (%s)", p.name, human_size(p.stat().st_size))
         try:
-            ok = send_one(p)
+            logging.info("Preparando envio: %s (%s)", p.name, human_size(p.stat().st_size))
+            ok = send_one(cfg, p)
             if not ok:
-                logging.error("Falha ao enviar: %s", p.name)
-        except Exception:
-            logging.exception("Erro inesperado ao enviar: %s", p.name)
-
-# =========================
-# Main
-# =========================
-
-STOP = False
-
-def handle_sigterm(sig, frame):
-    global STOP
-    STOP = True
-    logging.warning("Sinal recebido (%s). Encerrando após o ciclo atual...", sig)
+                logging.error("Envio falhou: %s", p.name)
+        except Exception as e:
+            logging.exception("Erro ao processar %s: %s", p.name, e)
 
 def main():
-    # Garante diretórios
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    if MOVE_BAD_PARTS:
-        QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    global cfg
+    cfg = load_cfg()
+
+    # Garante pastas
+    cfg.download_dir.mkdir(parents=True, exist_ok=True)
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.quarantine_dir:
+        cfg.quarantine_dir.mkdir(parents=True, exist_ok=True)
 
     logging.info(
         "Uploader iniciado. Pasta detectada: %s | WATCH=%s",
-        str(DOWNLOAD_DIR), WATCH
+        str(cfg.download_dir), int(cfg.watch)
     )
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("TELEGRAM_TOKEN e/ou TELEGRAM_CHAT_ID não configurados.")
+    # Avisos de configuração
+    if not cfg.chat_id:
+        logging.error("TELEGRAM_CHAT_ID não definido no .env")
+    if not cfg.bot_token:
+        logging.error("TELEGRAM_TOKEN não definido no .env")
+    if cfg.enable_mtproto and (not cfg.tg_api_id or not cfg.tg_api_hash):
+        logging.error("ENABLE_MTPROTO=1 mas TG_API_ID/TG_API_HASH não estão definidos.")
 
-    # Sinais para encerramento gracioso sob PM2
-    signal.signal(signal.SIGINT, handle_sigterm)
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
-    if not WATCH:
-        run_once()
-        return
-
-    while not STOP:
-        try:
-            run_once()
-            for _ in range(WATCH_INTERVAL):
-                if STOP:
-                    break
-                time.sleep(1)
-        except KeyboardInterrupt:
-            break
-        except Exception:
-            logging.exception("Loop principal: erro inesperado")
-            time.sleep(5)
+    # Loop
+    if getenv_bool("WATCH", 1):
+        while not _stop:
+            run_once(cfg)
+            time.sleep(cfg.watch_interval)
+    else:
+        run_once(cfg)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
+    main()
