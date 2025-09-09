@@ -10,7 +10,7 @@ const PY = fs.existsSync(path.join(VENV_BIN, 'python3')) ? 'python3' : 'python';
 module.exports = {
   apps: [
     {
-      name: "char-collector",
+      name: "charbot",
       script: "woman.py",
       cwd: __dirname,
       interpreter: PY,
