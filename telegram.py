@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 
 # =========================
-# Helpers básicos / ENV
+# Helpers básicos
 # =========================
 
 def getenv_bool(name: str, default: str = "0") -> bool:
@@ -36,9 +36,64 @@ def which_ffprobe() -> Optional[str]:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Diretórios
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", str(SCRIPT_DIR / "download"))).resolve()
-QUARANTINE_DIR = Path(os.getenv("QUARANTINE_DIR", str(DOWNLOAD_DIR / "_bad"))).resolve()
+# =========================
+# Carrega .env local (se existir)
+# =========================
+# Isso garante que as variáveis do .env sejam lidas mesmo quando o PM2 não injeta env.
+try:
+    from dotenv import load_dotenv
+    _dot = SCRIPT_DIR / ".env"
+    if _dot.exists():
+        load_dotenv(dotenv_path=_dot, override=True)
+except Exception:
+    pass
+
+# =========================
+# Descoberta de diretórios (dinâmica)
+# =========================
+
+def detect_download_dir() -> Path:
+    """
+    1) DOWNLOAD_DIR do env (se existir)
+    2) /root/charbot/download
+    3) SCRIPT_DIR/download
+    4) CWD/download
+    Cria a pasta escolhida, se não existir.
+    """
+    cands: List[Path] = []
+
+    env_dir = os.getenv("DOWNLOAD_DIR", "").strip()
+    if env_dir:
+        cands.append(Path(env_dir).expanduser())
+
+    cands.append(Path("/root/charbot/download"))
+    cands.append(SCRIPT_DIR / "download")
+    cands.append(Path.cwd() / "download")
+
+    for c in cands:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            return c.resolve()
+        except Exception:
+            continue
+
+    # fallback duro
+    fallback = SCRIPT_DIR / "download"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback.resolve()
+
+def detect_quarantine_dir(download_dir: Path) -> Path:
+    env_q = os.getenv("QUARANTINE_DIR", "").strip()
+    q = Path(env_q) if env_q else (download_dir / "_bad")
+    q.mkdir(parents=True, exist_ok=True)
+    return q.resolve()
+
+# =========================
+# Variáveis (após descobrir pastas)
+# =========================
+
+DOWNLOAD_DIR = detect_download_dir()
+QUARANTINE_DIR = detect_quarantine_dir(DOWNLOAD_DIR)
 
 # Bot
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -62,7 +117,7 @@ EXTENSIONS = [e.strip().lower() for e in EXTENSIONS if e.strip()]
 # Tamanhos e estabilidade
 MIN_FILE_MB = int(os.getenv("MIN_FILE_MB", "5"))           # ignora arquivos finais < 5MB
 MAX_FILE_GB = float(os.getenv("MAX_FILE_GB", "0"))         # 0 = sem limite
-FILE_STABLE_AGE = int(os.getenv("FILE_STABLE_AGE", "30"))  # segundos sem mudar mtime para considerar "estável"
+FILE_STABLE_AGE = int(os.getenv("FILE_STABLE_AGE", os.getenv("STABLE_AGE", "30")))  # compat
 
 # Recuperação de .part
 RECOVER_PARTS = getenv_bool("RECOVER_PARTS", "1")
@@ -384,10 +439,11 @@ def build_caption(path: Path) -> str:
         size = human_size(path.stat().st_size)
     except FileNotFoundError:
         size = "?"
+    # Você pode personalizar com tags de pasta, etc:
     return f"{path.name} | {size}"
 
 # =========================
-# Envio para Telegram (sempre vídeo)
+# Envio p/ Telegram (sempre VÍDEO)
 # =========================
 
 def upload_via_bot(chat_id: str, path: Path, caption: str) -> bool:
@@ -401,7 +457,7 @@ def upload_via_bot(chat_id: str, path: Path, caption: str) -> bool:
         logging.error("Biblioteca 'requests' não instalada.")
         return False
 
-    # Encoder com barra de progresso
+    # Encoder com barra de progresso (opcional)
     try:
         from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
     except Exception:
@@ -426,7 +482,6 @@ def upload_via_bot(chat_id: str, path: Path, caption: str) -> bool:
 
     headers = {"User-Agent": USER_AGENT}
 
-    # Preferir progresso se 'requests-toolbelt' existir
     if MultipartEncoder and MultipartEncoderMonitor:
         fields["video"] = (filename, open(mp4_path, "rb"), "video/mp4")
         enc = MultipartEncoder(fields=fields)
@@ -444,7 +499,7 @@ def upload_via_bot(chat_id: str, path: Path, caption: str) -> bool:
             r = requests.post(url, data=mon, headers=headers, timeout=60*60)
             if r.ok:
                 logging.info("BOT enviado: %s", filename)
-                # Limpa temporários criados nesta função
+                # Limpa temporários gerados nesta função
                 for t in temps:
                     if t != path and t.exists():
                         with contextlib.suppress(Exception):
@@ -498,7 +553,7 @@ def run_once():
     if RECOVER_PARTS:
         recover_partials(DOWNLOAD_DIR)
 
-    # 2) Envia arquivos prontos
+    # 2) Envia arquivos prontos (varre recursivamente subpastas)
     files = list_ready_files(DOWNLOAD_DIR)
     if not files:
         logging.debug("Nenhum arquivo pronto para envio.")
@@ -525,7 +580,7 @@ def handle_sigterm(sig, frame):
     logging.warning("Sinal recebido (%s). Encerrando após o ciclo atual...", sig)
 
 def main():
-    # Cria diretório base se não existir
+    # Garante diretórios
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if MOVE_BAD_PARTS:
         QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
@@ -537,7 +592,6 @@ def main():
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("TELEGRAM_TOKEN e/ou TELEGRAM_CHAT_ID não configurados.")
-        # Ainda assim, mantemos o loop para registrar problemas; mas sem token não envia.
 
     # Sinais para encerramento gracioso sob PM2
     signal.signal(signal.SIGINT, handle_sigterm)
@@ -555,7 +609,6 @@ def main():
                     break
                 time.sleep(1)
         except KeyboardInterrupt:
-            # PM2 pode sinalizar reinício; finalizamos gracioso
             break
         except Exception:
             logging.exception("Loop principal: erro inesperado")
