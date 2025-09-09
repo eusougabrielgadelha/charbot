@@ -1,0 +1,10 @@
+# Core (crawler/baixa)
+playwright>=1.44
+yt-dlp>=2024.03.10
+
+# Uploader (Bot API)
+requests>=2.31.0
+requests-toolbelt>=1.0.0
+
+# Opcional: MTProto para arquivos grandes
+telethon>=1.33.1
