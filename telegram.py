@@ -364,12 +364,12 @@ def finalize_part_file(p: Path) -> Optional[Path]:
 
 def recover_partials(root: Path) -> List[Path]:
     """
-    Busca .part estáveis e tenta finalizar.
+    Busca .part estáveis e tenta finalizar (AGORA RECURSIVO).
     Move para quarentena se falhar (opcional).
     """
     recovered: List[Path] = []
     now = time.time()
-    for pf in sorted(root.glob("*.part")):
+    for pf in sorted(root.rglob("*.part")):  # <-- rglob para achar em subpastas
         try:
             age = now - pf.stat().st_mtime
             size = pf.stat().st_size
@@ -377,20 +377,21 @@ def recover_partials(root: Path) -> List[Path]:
             continue
 
         if age < PART_STABLE_AGE:
+            logging.debug("Parcial jovem (%.0fs < %ds): %s", age, PART_STABLE_AGE, pf)
             continue
         if size < PART_MIN_MB * 1024 * 1024:
-            logging.warning("Parcial muito pequeno, pulando por enquanto: %s (%s)", pf.name, human_size(size))
+            logging.warning("Parcial muito pequeno, pulando: %s (%s)", pf.name, human_size(size))
             continue
 
-        logging.info("Recuperando parcial: %s", pf.name)
+        logging.info("Recuperando parcial: %s", pf)
         out = finalize_part_file(pf)
         if out and out.exists():
             with contextlib.suppress(Exception):
                 pf.unlink()
-            logging.info("Parcial finalizado ➜ %s (%s)", out.name, human_size(out.stat().st_size))
+            logging.info("Parcial finalizado ➜ %s (%s)", out, human_size(out.stat().st_size))
             recovered.append(out)
         else:
-            logging.warning("Falha ao finalizar parcial: %s", pf.name)
+            logging.warning("Falha ao finalizar parcial: %s", pf)
             if MOVE_BAD_PARTS:
                 try:
                     QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
@@ -400,6 +401,7 @@ def recover_partials(root: Path) -> List[Path]:
                 except Exception as e:
                     logging.error("Não foi possível mover para quarentena: %s -> %s (%s)", pf, QUARANTINE_DIR, e)
     return recovered
+
 
 # =========================
 # Seleção de arquivos prontos
@@ -413,25 +415,70 @@ def is_stable(path: Path, min_age: int) -> bool:
         return False
 
 def list_ready_files(root: Path) -> List[Path]:
+    """
+    Lista arquivos finalizados, recorrendo subpastas e explicando no log
+    por que cada um foi ignorado (tamanho, idade, extensão ou limite).
+    Também ignora temporários tipo '.__tmp__.mp4'.
+    Permite 'FORCE_SEND_ALL=1' para ignorar idade mínima.
+    """
+    force = str(os.getenv("FORCE_SEND_ALL", "0")).strip() in ("1", "true", "yes", "on")
     candidates: List[Path] = []
-    for ext in EXTENSIONS:
-        for p in root.rglob(f"*{ext}"):
-            if p.name.endswith(".part"):
-                continue
+    exts = set(EXTENSIONS)  # p.ex.: {".mp4",".mkv",".mov",".m4v"}
+
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+
+        suf = p.suffix.lower()
+        if suf not in exts:
+            continue
+
+        name = p.name.lower()
+
+        # ignora parciais/temporários
+        if name.endswith(".part"):
+            logging.debug("Ignorando .part: %s", p)
+            continue
+        if "__tmp__" in name:
+            logging.debug("Ignorando temporário (__tmp__): %s", p)
+            continue
+
+        # tamanho
+        try:
+            size = p.stat().st_size
+        except FileNotFoundError:
+            continue
+
+        if size < MIN_FILE_MB * 1024 * 1024:
+            logging.debug("Ignorando (pequeno < %dMB): %s (%s)", MIN_FILE_MB, p, human_size(size))
+            continue
+
+        # limite de tamanho (se configurado)
+        if MAX_FILE_GB > 0 and size > MAX_FILE_GB * (1024 ** 3):
+            logging.warning("Ignorando (muito grande, > %.2fGB): %s (%s)", MAX_FILE_GB, p, human_size(size))
+            continue
+
+        # estabilidade (a não ser que FORCE_SEND_ALL)
+        if not force:
             try:
-                size = p.stat().st_size
+                age = time.time() - p.stat().st_mtime
             except FileNotFoundError:
                 continue
-            if size < MIN_FILE_MB * 1024 * 1024:
+            if age < FILE_STABLE_AGE:
+                logging.debug("Ignorando (ainda mexendo, %.0fs < %ds): %s", age, FILE_STABLE_AGE, p)
                 continue
-            if not is_stable(p, FILE_STABLE_AGE):
-                continue
-            if MAX_FILE_GB > 0 and size > MAX_FILE_GB * (1024 ** 3):
-                logging.warning("Ignorando (muito grande, > %.2fGB): %s (%s)", MAX_FILE_GB, p.name, human_size(size))
-                continue
-            candidates.append(p)
-    # mais antigos primeiro
-    candidates.sort(key=lambda x: x.stat().st_mtime)
+
+        candidates.append(p)
+
+    # mais antigos primeiro (quem está “parado” há mais tempo sai antes)
+    def mtime_safe(x: Path) -> float:
+        try:
+            return x.stat().st_mtime
+        except FileNotFoundError:
+            return time.time()
+
+    candidates.sort(key=mtime_safe)
+    logging.info("Prontos para envio (%d): %s", len(candidates), ", ".join(str(c) for c in candidates[:10]) + ("..." if len(candidates) > 10 else ""))
     return candidates
 
 def build_caption(path: Path) -> str:
