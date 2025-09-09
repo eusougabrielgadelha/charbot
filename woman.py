@@ -22,7 +22,7 @@ from collections import deque
 # =========================
 # Defaults
 # =========================
-DEFAULT_START_URL = "https://chaturbate.com/tag/squirt/"
+DEFAULT_START_URL = "https://chaturbate.com/female-cams/"
 DEFAULT_MAX_ACTIVE = 8  
 DEFAULT_LIMIT_ROOMS = 100
 DEFAULT_DOWNLOAD_DIR = "download"
