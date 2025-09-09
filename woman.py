@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+woman.py — Coletor/baixador com retomada à prova de quedas
+
+Principais recursos:
+- Coleta URLs de salas a partir de uma listagem (Playwright headless).
+- Baixa em paralelo com yt-dlp, usando .part (padrão) para permitir retomada.
+- Se o processo cair/interromper:
+  * Na próxima execução: varre .part estáveis e tenta finalizar para .mp4.
+  * Em SIGINT/SIGTERM: antes de sair, tenta finalizar parciais.
+- Pós-processamento: remux (copy) → fallback transcode 720p, opcionalmente normaliza FPS mínimo.
+
+Dependências:
+  pip install -U playwright yt-dlp
+  python -m playwright install chromium
+  python -m playwright install-deps chromium    # em Debian/Ubuntu
+  sudo apt-get install -y ffmpeg
+"""
 
 import os
 import re
 import sys
 import time
-import random
 import glob
 import shutil
 import argparse
 import logging
 import threading
 import subprocess
-import inspect  # <<-- ADICIONADO
+import signal
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from contextlib import contextmanager, suppress
@@ -23,17 +39,21 @@ from collections import deque
 # Defaults
 # =========================
 DEFAULT_START_URL = "https://chaturbate.com/female-cams/"
-DEFAULT_MAX_ACTIVE = 8  
-DEFAULT_LIMIT_ROOMS = 100
+DEFAULT_SELECTOR = 'li.roomCard a[data-testid="room-card-username"][href]'
+DEFAULT_MAX_ACTIVE = 16
+DEFAULT_LIMIT_ROOMS = 60
 DEFAULT_DOWNLOAD_DIR = "download"
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_CHECK_INTERVAL = 2.0
 DEFAULT_NAV_TIMEOUT_MS = 60_000
-DEFAULT_SELECTOR = 'li.roomCard a[data-testid="room-card-username"][href]'
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+# Quanto tempo um .part precisa ficar sem ser modificado
+# para considerarmos "estável" e tentar finalizar
+DEFAULT_PART_STABLE_SEC = 60
 
 # =========================
 # Logging
@@ -94,6 +114,12 @@ def is_video_file(path: str) -> bool:
 def stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
+def is_stable_file(p: Path, min_age_sec: int) -> bool:
+    try:
+        return p.exists() and (time.time() - p.stat().st_mtime) >= min_age_sec
+    except Exception:
+        return False
+
 # =========================
 # Playwright helpers
 # =========================
@@ -111,12 +137,6 @@ def browser_context(user_agent: str, headless: bool = True, cookies_from_browser
             "--disable-software-rasterizer",
         ])
         ctx = browser.new_context(user_agent=user_agent)
-        if cookies_from_browser:
-            try:
-                # tentativa básica: não garantido em VPS headless
-                ctx = browser.new_context(storage_state=cookies_from_browser)
-            except Exception:
-                pass
         if cookie_file and os.path.isfile(cookie_file):
             try:
                 import json
@@ -137,7 +157,7 @@ def browser_context(user_agent: str, headless: bool = True, cookies_from_browser
 def scroll_page(page: Page, steps: int = 0, pause_ms: int = 800):
     if steps <= 0:
         return
-    for i in range(steps):
+    for _ in range(steps):
         page.mouse.wheel(0, 4000)
         page.wait_for_timeout(pause_ms)
 
@@ -174,28 +194,31 @@ class YTDLPEntry:
     outfile: str
 
 def build_outtmpl(username: str, download_dir: str) -> Tuple[str, str]:
-    # grava em subpasta por username
+    """
+    Gera caminho final (.mp4) e esperado parcial (.mp4.part).
+    O yt-dlp escreverá 'outfile.part' e, ao concluir, renomeará para 'outfile'.
+    """
     subdir = os.path.join(download_dir, safe_name(username))
     ensure_dir(subdir)
-    # mp4 final:
     outfile = os.path.join(subdir, f"{stamp()}_{safe_name(username)}.mp4")
-    # parcial:
     tmpfile = outfile + ".part"
     return tmpfile, outfile
 
 def parse_username_from_url(url: str) -> str:
-    # ex: https://chaturbate.com/USERNAME/
     m = re.search(r"chaturbate\.com/([^/]+)/?", url)
     return safe_name(m.group(1)) if m else "unknown"
 
 def ytdlp_download(url: str, outtmpl: str, extra_args: Optional[List[str]] = None) -> int:
+    """
+    Executa yt-dlp.
+    Importante: NÃO usamos --no-part. Assim, o .part fica disponível para retomada.
+    """
     args = [
         "yt-dlp",
         "--no-color",
         "--newline",
-        "--no-part",             # vamos nós controlar .part
-        "--retries", "3",
-        "--fragment-retries", "3",
+        "--retries", "5",
+        "--fragment-retries", "5",
         "--concurrent-fragments", "5",
         "--downloader", "ffmpeg",
         "-o", outtmpl,
@@ -203,100 +226,92 @@ def ytdlp_download(url: str, outtmpl: str, extra_args: Optional[List[str]] = Non
     ]
     if extra_args:
         args += extra_args
-    logging.info("Iniciando yt-dlp para: %s", url)
+
+    logging.info("Iniciando yt-dlp: %s", url)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    last_line = ""
     try:
         for line in proc.stdout:
-            last_line = line.rstrip()
-            if "[download]" in last_line or "[Chaturbate]" in last_line:
-                logging.info(last_line)
+            line = (line or "").rstrip()
+            if line:
+                # filtros simples para não poluir demais
+                if ("[download]" in line) or ("[Chaturbate]" in line) or ("Merging formats" in line):
+                    logging.info(line)
     except Exception:
         pass
     rc = proc.wait()
     logging.info("yt-dlp terminou rc=%s para %s", rc, url)
     return rc
 
-def remux_inplace_safe(path: str, min_fps: int = 0) -> bool:
-    """Remux e normaliza para mp4 h264/aac. Se min_fps>0, aumenta fps mínimo."""
-    if not os.path.isfile(path):
-        return False
+def remux_copy_to_mp4(src: str, dst: str) -> bool:
     ffmpeg = which_ffmpeg()
     if not ffmpeg:
-        logging.warning("ffmpeg não encontrado; remux pulado: %s", path)
-        return True
-    tmp_out = path + ".__tmp__.mp4"
-    cmd = [
-        ffmpeg, "-y",
-        "-i", path,
-        "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart",
-        "-c:a", "aac", "-b:a", "128k"
-    ]
-    if min_fps > 0:
-        cmd.extend(["-vf", f"fps=fps={min_fps}"])
-    cmd.extend([tmp_out])
-    logging.info("Remux: %s", os.path.basename(path))
-    rc, out = run_cmd(cmd, check=False)
-    if rc == 0 and os.path.isfile(tmp_out):
-        try:
-            os.replace(tmp_out, path)
-            return True
-        except Exception as e:
-            logging.error("Falha ao substituir após remux: %s", e)
-            with suppress(Exception): os.remove(tmp_out)
-    else:
-        with suppress(Exception): os.remove(tmp_out)
-        logging.error("ffmpeg remux falhou em %s", path)
-    return False
+        logging.warning("ffmpeg não encontrado; remux pulado: %s", src)
+        return False
+    cmd = [ffmpeg, "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst]
+    rc, _ = run_cmd(cmd)
+    ok = (rc == 0) and os.path.isfile(dst)
+    if not ok:
+        with suppress(Exception): os.path.isfile(dst) and os.remove(dst)
+    return ok
 
-def run_ffmpeg_transcode(input_path: str, output_path: str, extra_args: Optional[List[str]] = None) -> bool:
+def transcode_720_to_mp4(src: str, dst: str) -> bool:
     ffmpeg = which_ffmpeg()
     if not ffmpeg:
-        logging.error("ffmpeg não encontrado para transcode.")
+        logging.warning("ffmpeg não encontrado; transcode pulado: %s", src)
         return False
-    cmd = [ffmpeg, "-y", "-i", input_path]
-    if extra_args:
-        cmd += extra_args
-    cmd += [output_path]
-    rc, out = run_cmd(cmd, check=False)
-    return rc == 0 and os.path.isfile(output_path)
+    cmd = [
+        ffmpeg, "-y", "-i", src,
+        "-c:v", "libx264", "-preset", "veryfast", "-vf", "scale=-2:720",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+        dst
+    ]
+    rc, _ = run_cmd(cmd)
+    ok = (rc == 0) and os.path.isfile(dst)
+    if not ok:
+        with suppress(Exception): os.path.isfile(dst) and os.remove(dst)
+    return ok
 
 def try_finalize_partial(tmp_path: str, min_fps: int = 0, do_720_when_fail: bool = True) -> bool:
-    """Se existir arquivo .part, tenta finalizar (remux/transcode) para mp4 definitivo."""
+    """
+    Tenta transformar um arquivo parcial (.part) em .mp4 utilizável.
+    1) remux (copy) → rápido
+    2) fallback: transcode 720p
+    Retorna True se gerou .mp4.
+    """
     if not tmp_path or not os.path.isfile(tmp_path):
         return False
-    mp4_path = tmp_path[:-5] if tmp_path.endswith(".part") else tmp_path + ".mp4"
+
+    if tmp_path.endswith(".part"):
+        mp4_path = tmp_path[:-5]  # remove ".part"
+    else:
+        mp4_path = tmp_path + ".mp4"
+
     if os.path.isfile(mp4_path):
+        # já existe final — nada a fazer
         return True
-    ok = remux_inplace_safe(tmp_path, min_fps=min_fps)
-    if ok:
+
+    # 1) tenta remux (copy)
+    if remux_copy_to_mp4(tmp_path, mp4_path):
+        logging.info("Remux OK: %s -> %s", os.path.basename(tmp_path), os.path.basename(mp4_path))
+        return True
+
+    # 2) fallback: transcode 720p
+    tmp_out = mp4_path + ".__720p__.mp4"
+    if transcode_720_to_mp4(tmp_path, tmp_out):
         try:
-            os.rename(tmp_path, mp4_path)
-            logging.info("Finalizado parcial → %s", mp4_path)
+            os.replace(tmp_out, mp4_path)
+            with suppress(Exception): os.remove(tmp_path)
+            logging.info("Transcode 720p OK: %s", os.path.basename(mp4_path))
             return True
         except Exception as e:
-            logging.error("Falha ao renomear parcial para mp4: %s", e)
-            return False
-    if do_720_when_fail:
-        tmp_out = mp4_path + ".__from_part__.mp4"
-        ok2 = run_ffmpeg_transcode(tmp_path, tmp_out, extra_args=["-vf", "scale=-2:720"])
-        if ok2:
-            try:
-                os.replace(tmp_out, mp4_path)
-                with suppress(Exception): os.remove(tmp_path)
-                logging.info("Convertido parcial para 720p: %s", mp4_path)
-                return True
-            except Exception as e:
-                logging.error("Falha ao substituir após 720p: %s", e)
-                with suppress(Exception): os.remove(tmp_out)
-        else:
+            logging.error("Falha ao substituir após 720p: %s", e)
             with suppress(Exception): os.remove(tmp_out)
+
     return False
 
 def salvage_outputs(tmp_path: Optional[str], out_path: Optional[str], min_fps: int = 0):
     """Tenta salvar algo útil caso download falhe."""
     if out_path and os.path.isfile(out_path):
-        remux_inplace_safe(out_path, min_fps=min_fps)
         return
     if tmp_path and os.path.isfile(tmp_path):
         try_finalize_partial(tmp_path, min_fps=min_fps)
@@ -311,26 +326,21 @@ class JobInfo:
     tmpfile: str
     outfile: str
     status: str = "queued"  # queued, running, done, error
-    last_info: Optional[dict] = None
 
 def worker(job: JobInfo, check_interval: float = DEFAULT_CHECK_INTERVAL, min_fps: int = 0):
-    """Baixa uma sala (yt-dlp) para arquivo. Controla .part/outfile."""
+    """Baixa uma sala com yt-dlp. Se cair, tenta finalizar parcial."""
     try:
         job.status = "running"
-        # Garantir tmpfile exista, mesmo com --no-part
-        Path(job.tmpfile).touch(exist_ok=True)
+        # NÃO tocar no .part; deixe yt-dlp controlar
 
         rc = ytdlp_download(job.url, job.outfile)
+
+        # Concluído normalmente?
         if rc == 0 and os.path.isfile(job.outfile):
-            # já veio mp4 final
-            remux_inplace_safe(job.outfile, min_fps=min_fps)
-            with suppress(Exception):
-                if os.path.isfile(job.tmpfile):
-                    os.remove(job.tmpfile)
             job.status = "done"
             return
 
-        # Se não produziu outfile, tentar salvar parcial
+        # Se não finalizou, tentar salvar parcial
         if os.path.isfile(job.tmpfile):
             ok = try_finalize_partial(job.tmpfile, min_fps=min_fps)
             if ok:
@@ -338,8 +348,8 @@ def worker(job: JobInfo, check_interval: float = DEFAULT_CHECK_INTERVAL, min_fps
                 return
 
         job.status = "error"
-    except Exception as e:
-        logging.exception("Erro no worker %s: %s", job.url, e)
+    except Exception:
+        logging.exception("Erro no worker %s", job.url)
         job.status = "error"
 
 def build_jobs(urls: List[str], download_dir: str) -> List[JobInfo]:
@@ -350,69 +360,47 @@ def build_jobs(urls: List[str], download_dir: str) -> List[JobInfo]:
         jobs.append(JobInfo(url=url, username=username, tmpfile=tmp, outfile=outp))
     return jobs
 
-def monitor_progress(stop_evt: threading.Event, jobs: List[JobInfo]):
-    while not stop_evt.is_set():
-        total = len(jobs)
-        done = sum(1 for j in jobs if j.status == "done")
-        running = sum(1 for j in jobs if j.status == "running")
-        err = sum(1 for j in jobs if j.status == "error")
-        que = sum(1 for j in jobs if j.status == "queued")
-        logging.info("Status: queued=%d running=%d done=%d error=%d / total=%d", que, running, done, err, total)
-        stop_evt.wait(5.0)
-
 # =========================
-# Pós-processamento em lote
+# Varreduras e pós-proc
 # =========================
-def sweep_finalize_partials(root_dir: str, min_fps: int = 0):
-    """Passa varrendo .part para tentar finalizar."""
+def sweep_finalize_partials(root_dir: str, min_fps: int = 0, min_age_sec: int = DEFAULT_PART_STABLE_SEC) -> int:
+    """
+    Varre diretório por *.part "estáveis" e tenta finalizar.
+    Retorna quantos foram finalizados.
+    """
+    count = 0
     for part in Path(root_dir).rglob("*.part"):
-        try_finalize_partial(str(part), min_fps=min_fps)
-
-def sweep_transcode_everything_to_720(root_dir: str, already_done: Optional[set] = None):
-    """Transcodifica tudo que for vídeo para 720p inplace (cuidado)."""
-    if already_done is None:
-        already_done = set()
-    for p in Path(root_dir).rglob("*"):
-        if not p.is_file():
-            continue
-        if str(p) in already_done:
-            continue
-        if is_video_file(str(p)):
-            remux_inplace_safe(str(p), min_fps=30)
-
-def finalize_to_720_from_sources(part_path: Optional[str], mp4_path: Optional[str]):
-    """Fallback: se download falha, tenta gerar 720p a partir do que tiver."""
-    if mp4_path and os.path.isfile(mp4_path):
-        remux_inplace_safe(mp4_path, min_fps=30)
-        return
-    if part_path and os.path.isfile(part_path):
-        try_finalize_partial(part_path, min_fps=30)
+        try:
+            if is_stable_file(part, min_age_sec):
+                if try_finalize_partial(str(part), min_fps=min_fps):
+                    count += 1
+        except Exception:
+            logging.exception("Erro finalizando parcial: %s", part)
+    if count:
+        logging.info("Parciais finalizadas nesta varredura: %d", count)
+    return count
 
 # =========================
 # Pipeline principal
 # =========================
 def main():
-    parser = argparse.ArgumentParser(description="Coletor de salas + downloads paralelos (yt-dlp → MP4).")
-    parser.add_argument("--start-url", default=DEFAULT_START_URL, help="URL inicial.")
-    parser.add_argument("--selector", default=DEFAULT_SELECTOR, help="Seletor de CSS dos links de sala.")
+    parser = argparse.ArgumentParser(description="Coletor de salas + downloads paralelos (yt-dlp → MP4) com retomada.")
+    parser.add_argument("--start-url", default=DEFAULT_START_URL, help="URL inicial da listagem.")
+    parser.add_argument("--selector", default=DEFAULT_SELECTOR, help="Seletor CSS dos links de sala.")
     parser.add_argument("--max-active", type=int, default=DEFAULT_MAX_ACTIVE, help="Máximo de downloads simultâneos.")
     parser.add_argument("--limit-rooms", type=int, default=DEFAULT_LIMIT_ROOMS, help="Quantas salas coletar.")
     parser.add_argument("--download-dir", default=DEFAULT_DOWNLOAD_DIR, help="Diretório de saída.")
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="Diretório para logs.")
-    parser.add_argument("--check-interval", type=float, default=DEFAULT_CHECK_INTERVAL, help="Intervalo de checagem (s).")
+    parser.add_argument("--check-interval", type=float, default=DEFAULT_CHECK_INTERVAL, help="Intervalo (s) de checagem.")
     parser.add_argument("--nav-timeout-ms", type=int, default=DEFAULT_NAV_TIMEOUT_MS, help="Timeout de navegação (ms).")
-    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent para o navegador.")
-    parser.add_argument("--headless", action="store_true", default=True, help="Navegador headless (padrão).")
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent do navegador.")
+    parser.add_argument("--headless", action="store_true", default=True, help="Headless (padrão).")
     parser.add_argument("--no-headless", dest="headless", action="store_false", help="Navegador com UI.")
-    parser.add_argument("--scroll", type=int, default=0, help="Passos de scroll para carregar mais cartões (0 = nenhum).")
+    parser.add_argument("--scroll", type=int, default=0, help="Quantidade de scrolls para carregar mais cartões.")
     parser.add_argument("--scroll-pause-ms", type=int, default=800, help="Pausa entre scrolls (ms).")
-    parser.add_argument("--output-template", default="", help="(Ignorado) Nome é fixo por username.")
-    parser.add_argument("--cookies-from-browser", choices=["chrome", "msedge", "firefox", "chromium"],
-                        default=None, help="Tentar cookies do navegador local (pouco útil em VPS).")
     parser.add_argument("--cookie-file", default=None, help="Arquivo JSON de cookies (Playwright).")
-    parser.add_argument("--min-fps", type=int, default=0, help="Se >0, força FPS mínimo no remux.")
-    parser.add_argument("--postprocess-720", action="store_true", default=False,
-                        help="Após rodar, tenta transcodificar tudo para 720p.")
+    parser.add_argument("--min-fps", type=int, default=0, help="Se >0, normaliza FPS mínimo no remux/transcode (em recuperação).")
+    parser.add_argument("--part-stable-sec", type=int, default=DEFAULT_PART_STABLE_SEC, help="Inatividade necessária do .part para finalizar.")
     args = parser.parse_args()
 
     ensure_dir(args.download_dir)
@@ -422,11 +410,24 @@ def main():
     logging.info("=== Início ===")
     logging.info("Args: %s", args)
 
-    # Coleta de salas
+    # 0) Recuperação ANTES de iniciar: varre e tenta finalizar parciais
+    sweep_finalize_partials(args.download_dir, min_fps=args.min_fps, min_age_sec=args.part_stable_sec)
+
+    # 0.1) Instala tratamento de sinais para finalizar parciais antes de sair
+    def _graceful_shutdown(signum, frame):
+        logging.warning("Sinal %s recebido. Tentando finalizar parciais...", signum)
+        try:
+            sweep_finalize_partials(args.download_dir, min_fps=args.min_fps, min_age_sec=10)
+        finally:
+            os._exit(0)
+
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+
+    # 1) Coleta de salas (Playwright)
     with browser_context(
         user_agent=args.user_agent,
         headless=args.headless,
-        cookies_from_browser=args.cookies_from_browser,
         cookie_file=args.cookie_file,
         nav_timeout_ms=args.nav_timeout_ms
     ) as page:
@@ -441,10 +442,12 @@ def main():
 
     if not rooms:
         logging.warning("Nenhuma sala coletada. Encerrando.")
+        # ainda assim, tenta finalizar parciais pendentes
+        sweep_finalize_partials(args.download_dir, min_fps=args.min_fps, min_age_sec=args.part_stable_sec)
         return
 
     if len(rooms) < args.max_active:
-        logging.warning("Menos salas do que o desejado (%d < %d). Continuando.", len(rooms), args.max_active)
+        logging.info("Menos salas do que o desejado (%d < %d). Continuando.", len(rooms), args.max_active)
 
     initial = rooms[: args.max_active]
     remaining = deque(rooms[args.max_active :])
@@ -452,57 +455,32 @@ def main():
 
     progress_lock = threading.Lock()
     jobs_lock = threading.Lock()
-    cancel_event = threading.Event()
-    stop_monitor = threading.Event()
-    progress_map: Dict[str, Dict[str, Optional[str]]] = {}
     active_jobs: List[JobInfo] = []
-
-    def monitor_progress_thread():
-        while not stop_monitor.is_set():
-            with progress_lock:
-                total = len(progress_map)
-                done = sum(1 for v in progress_map.values() if v.get("status") == "done")
-                running = sum(1 for v in progress_map.values() if v.get("status") == "running")
-                err = sum(1 for v in progress_map.values() if v.get("status") == "error")
-                que = sum(1 for v in progress_map.values() if v.get("status") == "queued")
-            logging.info("Fila: queued=%d running=%d done=%d error=%d / total=%d",
-                         que, running, done, err, total)
-            time.sleep(5.0)
-
-    monitor_thread = threading.Thread(target=monitor_progress_thread, daemon=True)
-    monitor_thread.start()
 
     def spawn_job(url: str):
         username = parse_username_from_url(url)
         tmp, outp = build_outtmpl(username, args.download_dir)
-        info = {"status": "queued", "tmpfile": tmp, "outfile": outp}
-        with progress_lock:
-            progress_map[url] = info
+
         job = JobInfo(url=url, username=username, tmpfile=tmp, outfile=outp)
-        t = threading.Thread(target=_runner, args=(job,), daemon=True)
         with jobs_lock:
             active_jobs.append(job)
-        t.start()
 
-    def _runner(job: JobInfo):
-        with progress_lock:
-            progress_map[job.url]["status"] = "running"
-        worker(job, check_interval=args.check_interval, min_fps=args.min_fps)
-        with progress_lock:
-            progress_map[job.url]["status"] = job.status
-        with jobs_lock:
-            # remove finished job
-            for i, j in enumerate(active_jobs):
-                if j.url == job.url:
-                    active_jobs.pop(i)
-                    break
-        # quando terminar um, se houver mais, dispara próximo
-        with jobs_lock:
-            if remaining:
-                next_url = remaining.popleft()
-                if next_url not in seen:
-                    seen.add(next_url)
-                spawn_job(next_url)
+        def _runner():
+            worker(job, check_interval=args.check_interval, min_fps=args.min_fps)
+            # terminou esse job → dispara o próximo da fila (se houver)
+            with jobs_lock:
+                try:
+                    active_jobs.remove(job)
+                except ValueError:
+                    pass
+                if remaining:
+                    next_url = remaining.popleft()
+                    if next_url not in seen:
+                        seen.add(next_url)
+                    spawn_job(next_url)
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
 
     # dispara os iniciais
     for u in initial:
@@ -512,41 +490,19 @@ def main():
     try:
         while True:
             with jobs_lock:
-                if not active_jobs and not remaining:
-                    break
-            time.sleep(1.0)
+                total = len(seen)
+                running = len(active_jobs)
+                pend = len(remaining)
+            done = total - (running + pend)
+            logging.info("Fila: running=%d pend=%d done=%d total=%d", running, pend, done, total)
+            if running == 0 and pend == 0:
+                break
+            time.sleep(5.0)
     except KeyboardInterrupt:
-        logging.warning("Interrompido pelo usuário.")
-        cancel_event.set()
+        logging.warning("Interrompido pelo usuário (KeyboardInterrupt).")
 
-    # pós-processamento opcional
-    if args.postprocess_720:
-        already = set()
-        with progress_lock:
-            for ent in progress_map.values():
-                tmp = ent.get("tmpfile")
-                outp = ent.get("outfile")
-                if tmp and os.path.isfile(tmp):
-                    already.add(os.path.abspath(tmp))
-                if outp and os.path.isfile(outp):
-                    already.add(os.path.abspath(outp))
-                finalize_to_720_from_sources(tmp, outp)
-
-            sweep_transcode_everything_to_720(args.download_dir, already_done=already)
-    else:
-        with progress_lock:
-            tmpfiles = [ent.get("tmpfile") for ent in progress_map.values() if ent.get("tmpfile")]
-            outfiles = [ent.get("outfile") for ent in progress_map.values() if ent.get("outfile")]
-        for tmp in tmpfiles:
-            try_finalize_partial(tmp, min_fps=args.min_fps)
-        for outp in outfiles:
-            if outp and os.path.isfile(outp):
-                remux_inplace_safe(outp, min_fps=args.min_fps)
-        sweep_finalize_partials(args.download_dir, min_fps=args.min_fps)
-
-    stop_monitor.set()
-    with suppress(Exception):
-        monitor_thread.join(timeout=3)
+    # 2) Pós-proc final: mais uma varredura para “pegar” qualquer .part residual
+    sweep_finalize_partials(args.download_dir, min_fps=args.min_fps, min_age_sec=10)
 
     logging.info("Pipeline encerrado.")
 
