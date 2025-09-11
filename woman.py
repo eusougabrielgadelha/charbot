@@ -41,7 +41,7 @@ from collections import deque
 DEFAULT_START_URL = "https://chaturbate.com/female-cams/"
 DEFAULT_SELECTOR = 'li.roomCard a[data-testid="room-card-username"][href]'
 DEFAULT_MAX_ACTIVE = 16
-DEFAULT_LIMIT_ROOMS = 0
+DEFAULT_LIMIT_ROOMS = 1000
 DEFAULT_DOWNLOAD_DIR = "download"
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_CHECK_INTERVAL = 2.0
